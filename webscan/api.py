@@ -26,6 +26,8 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import config
+from .checkup import check_site
+from .crawler import normalize_url
 from .engine import run_scan
 from .models import ScanOptions, ScanResult
 from .report import write_report
@@ -63,6 +65,9 @@ _progress: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
 _tasks: list[threading.Thread] = []
 MAX_CONCURRENT = 2
+_checkups = threading.BoundedSemaphore(2)
+_start_lock = threading.Lock()
+REVIEW_STATES = {'待复核', '误报', '已修复待验证'}
 
 # 本次运行的一次性令牌，注入首页 meta；POST/DELETE 必须带上
 _TOKEN = secrets.token_urlsafe(18)
@@ -102,9 +107,10 @@ def _setup_logging() -> None:
 # ----------------------------------------------------------------------
 # 扫描任务
 # ----------------------------------------------------------------------
-def _start_scan(target: str, options: ScanOptions) -> str:
+def _start_scan(target: str, options: ScanOptions, on_finish=None) -> str:
     scan = ScanResult.new(target)
-    get_store().create_scan(scan.id, target, options.to_dict())
+    scan_store = get_store()
+    scan_store.create_scan(scan.id, target, options.to_dict())
     with _lock:
         _progress[scan.id] = {"stage": "queued", "done": 0, "total": 0, "message": "排队中…"}
 
@@ -124,15 +130,19 @@ def _start_scan(target: str, options: ScanOptions) -> str:
                     cur["message"] = event["message"]
                 if event.get("type") in ("done", "error"):
                     cur["finished"] = True
+                    cur["stage"] = event["type"]
 
         try:
-            loop.run_until_complete(run_scan(store, scan, options, emit))
+            loop.run_until_complete(run_scan(scan_store, scan, options, emit))
         except Exception:
             log.exception("扫描任务异常：%s", scan.id)
         finally:
             loop.close()
+            if on_finish:
+                on_finish()
 
     th = threading.Thread(target=worker, name=f"scan-{scan.id}", daemon=True)
+    _tasks[:] = [task for task in _tasks if task.is_alive()]
     _tasks.append(th)
     th.start()
     return scan.id
@@ -184,8 +194,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if not 0 < length <= 16384:
+            self.close_connection = True
             return {}
         raw = self.rfile.read(length)
         try:
@@ -194,13 +208,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
-    def _guard(self) -> bool:
-        """本地访问保护：Host 白名单 + 写操作令牌。"""
+    def _local_host(self) -> bool:
+        """防止外站借由 DNS 重绑定访问本地服务。"""
         port = self.server.server_port
         host = (self.headers.get("Host") or "").lower()
         if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
             log.warning("拒绝非法 Host: %s", host)
             self._send_json({"detail": "非法访问来源"}, 403)
+            return False
+        return True
+
+    def _guard(self) -> bool:
+        if not self._local_host():
             return False
         token = self.headers.get("X-WebScan-Token", "")
         if not hmac.compare_digest(token, _TOKEN):
@@ -213,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- GET ----
     def do_GET(self) -> None:
+        if not self._local_host():
+            return
         parts = urlsplit(self.path)
         path = unquote(parts.path)
         query = parse_qs(parts.query)
@@ -234,11 +255,30 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/scans":
-            self._send_json({"items": get_store().list_scans()})
+            items = get_store().list_scans()
+            with _lock:
+                for item in items:
+                    if item["status"] in ("pending", "running"):
+                        item["progress"] = dict(_progress.get(item["id"], {}))
+            self._send_json({"items": items})
             return
 
         if path.startswith("/api/scans/"):
             rest = path[len("/api/scans/"):]
+            pieces = rest.split("/")
+            if len(pieces) >= 2 and pieces[1] == "pages":
+                if not self._guard():
+                    return
+                if len(pieces) == 2:
+                    self._send_json({"items": get_store().list_pages(pieces[0])})
+                    return
+                if len(pieces) == 3 and pieces[2].isascii() and pieces[2].isdigit() and len(pieces[2]) <= 18:
+                    text = get_store().snapshot(pieces[0], int(pieces[2]), query.get("kind") == ["rendered"])
+                    self._send_json({"text": text} if text is not None else {"detail": "没有保存该快照"},
+                                    200 if text is not None else 404)
+                    return
+                self._send_json({"detail": "页面不存在"}, 404)
+                return
             if rest.endswith("/export"):
                 scan_id = rest[: -len("/export")].strip("/")
                 self._export(scan_id, (query.get("fmt") or ["html"])[0])
@@ -259,36 +299,90 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._guard():
             return
-        if urlsplit(self.path).path != "/api/scans":
+        path = urlsplit(self.path).path
+        body = self._body()
+        if path == "/api/reviews":
+            finding_id, status, scan_id = body.get("finding_id"), body.get("status"), body.get("scan_id")
+            if (type(finding_id) is not int or not 0 < finding_id < 2**63
+                    or not isinstance(status, str) or status not in REVIEW_STATES
+                    or not isinstance(scan_id, str)):
+                self._send_json({"detail": "复核参数无效"}, 400)
+            elif not get_store().review_finding(scan_id, finding_id, status):
+                self._send_json({"detail": "发现项不存在"}, 404)
+            else:
+                self._send_json({"ok": True})
+            return
+
+        if path not in ("/api/scans", "/api/demo", "/api/checkup"):
             self._send_json({"detail": "Not Found"}, 404)
             return
-        body = self._body()
-        if not body.get("authorized"):
+        demo = path == "/api/demo"
+        if not demo and body.get("authorized") is not True:
             self._send_json({"detail": "必须确认对该目标拥有所有权或已获得授权"}, 403)
             return
-        if _running_count() >= MAX_CONCURRENT:
-            self._send_json({"detail": "同时运行的任务过多，请稍后再试"}, 429)
+        target = None
+        if not demo:
+            try:
+                url = body.get("url", "").strip()
+                if url and "://" not in url:
+                    url = "https://" + url
+                target = normalize_url(url)
+            except (AttributeError, ValueError):
+                pass
+            if not target:
+                self._send_json({"detail": "请输入有效的 HTTP(S) 地址"}, 400)
+                return
+
+        if path == "/api/checkup":
+            if not _checkups.acquire(blocking=False):
+                self._send_json({"detail": "安全体检任务过多，请稍后再试"}, 429)
+                return
+            try:
+                result = check_site(target)
+            except Exception:
+                log.exception("安全体检失败")
+                self._send_json({"detail": "安全体检失败，请检查目标地址"}, 400)
+            else:
+                self._send_json(result)
+            finally:
+                _checkups.release()
             return
 
-        url = (body.get("url") or "").strip()
-        if not url:
-            self._send_json({"detail": "请输入目标地址"}, 400)
-            return
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        parsed = urlsplit(url)
-        if parsed.scheme not in config.ALLOWED_SCHEMES or not parsed.hostname:
-            self._send_json({"detail": "目标地址格式不正确"}, 400)
+        try:
+            options = ScanOptions(
+                max_pages=25 if demo else max(1, min(500, int(body.get("max_pages") or config.DEFAULT_MAX_PAGES))),
+                max_depth=3 if demo else max(1, min(6, int(body.get("max_depth") or config.DEFAULT_MAX_DEPTH))),
+                deep=demo or body.get("deep") is True,
+                probe_sensitive=body.get("probe_sensitive", True) is True,
+                dynamic=body.get("dynamic") is True,
+                save_snapshots=demo or body.get("save_snapshots") is True,
+            )
+        except (ValueError, TypeError, OverflowError):
+            self._send_json({"detail": "页数或深度无效"}, 400)
             return
 
-        options = ScanOptions(
-            max_pages=max(1, min(500, int(body.get("max_pages") or config.DEFAULT_MAX_PAGES))),
-            max_depth=max(1, min(6, int(body.get("max_depth") or config.DEFAULT_MAX_DEPTH))),
-            deep=bool(body.get("deep")),
-            probe_sensitive=bool(body.get("probe_sensitive", True)),
-        )
-        scan_id = _start_scan(url, options)
-        log.info("新建扫描 %s -> %s (deep=%s)", scan_id, url, options.deep)
+        with _start_lock:
+            if _running_count() >= MAX_CONCURRENT:
+                self._send_json({"detail": "同时运行的任务过多，请稍后再试"}, 429)
+                return
+            if demo:
+                from labs.vuln_app import Handler as LabHandler
+
+                lab = ThreadingHTTPServer(("127.0.0.1", 0), LabHandler)
+                thread = threading.Thread(target=lab.serve_forever, daemon=True)
+                thread.start()
+
+                def stop_lab():
+                    lab.shutdown()
+                    lab.server_close()
+
+                try:
+                    scan_id = _start_scan(f"http://127.0.0.1:{lab.server_port}/", options, stop_lab)
+                except Exception:
+                    stop_lab()
+                    raise
+            else:
+                scan_id = _start_scan(target, options)
         self._send_json({"id": scan_id, "status": "running"})
 
     # ---- DELETE ----
@@ -300,6 +394,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"detail": "Not Found"}, 404)
             return
         scan_id = path[len("/api/scans/"):].strip("/")
+        with _lock:
+            progress = _progress.get(scan_id)
+            if progress and not progress.get("finished"):
+                self._send_json({"detail": "扫描运行中，完成后可以删除"}, 409)
+                return
         get_store().delete_scan(scan_id)
         with _lock:
             _progress.pop(scan_id, None)

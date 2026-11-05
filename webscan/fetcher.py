@@ -83,6 +83,7 @@ class Fetcher:
         data: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         follow: bool = True,
+        keep_bytes: bool = False,
     ) -> Page:
         page = Page(url=url, method=method, requested_url=url)
         async with self._sem:
@@ -116,7 +117,10 @@ class Fetcher:
                         page.status = response.status_code
                         page.headers = {k.lower(): v for k, v in response.headers.items()}
                         page.content_type = page.header("content-type")
-                        page.body = _decode(body, page.content_type)
+                        if keep_bytes:
+                            page.raw_body = bytes(body)
+                        else:
+                            page.body = _decode(body, page.content_type)
                         page.length = len(body)
                         page.url = str(response.url)
                         page.set_cookies = response.headers.get_list("set-cookie")

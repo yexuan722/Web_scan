@@ -1,124 +1,84 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="webscan-token" content="__WEBSCAN_TOKEN__">
-<title>WebScan · Web 漏洞扫描器</title>
-<link rel="icon" href="/static/favicon.ico">
-<link rel="stylesheet" href="/static/app.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="webscan-token" content="__WEBSCAN_TOKEN__">
+  <title>WebScan · 安全扫描工作台</title>
+  <link rel="icon" href="/static/favicon.ico">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
 </head>
 <body>
-<div class="app">
   <aside class="sidebar">
-    <div class="brand">
-      <div class="logo">WS</div>
-      <div>
-        <b>WebScan</b>
-        <span>v1.0</span>
-      </div>
-    </div>
-    <nav>
-      <button class="nav-item active" data-view="new">新建扫描</button>
-      <button class="nav-item" data-view="history">扫描记录</button>
-      <button class="nav-item" data-view="about">关于</button>
+    <div class="brand"><span class="brand-mark">W</span><div>WebScan<small>网站安全工作台</small></div></div>
+    <p class="nav-caption">工作区</p>
+    <nav aria-label="工作区">
+      <button data-view="home"><span>01</span> 工作台</button>
+      <button data-view="scan"><span>02</span> 新建扫描</button>
+      <button data-view="map"><span>03</span> 网站地图</button>
+      <button data-view="findings"><span>04</span> 漏洞复核</button>
+      <button data-view="checkup"><span>05</span> 安全体检</button>
+      <button data-view="history"><span>06</span> 扫描历史</button>
     </nav>
-    <div class="side-foot">
-      <span class="dot"></span> 仅限授权目标
-    </div>
+    <div class="sidebar-footer"><span class="indicator"></span> 本地运行<br><small>仅扫描自有或已获授权的目标</small></div>
   </aside>
-
   <main>
-    <!-- ============ 新建扫描 ============ -->
-    <section class="view" id="view-new">
-      <header class="page-head">
-        <h1>新建扫描</h1>
-        <p>爬取站点攻击面，分析配置与注入风险，输出可复核的漏洞清单与健康评分。</p>
-      </header>
-
-      <div class="card">
-        <label class="field-label" for="url">目标地址</label>
-        <div class="input-row">
-          <input id="url" type="text" spellcheck="false" placeholder="https://example.com">
-          <button id="startBtn" class="btn primary">开始扫描</button>
-        </div>
-
-        <div class="options">
-          <div class="opt">
-            <span class="opt-label">页面上限</span>
-            <input type="range" id="maxPages" min="10" max="500" step="10" value="120">
-            <span class="opt-val" id="maxPagesVal">120</span>
+    <header class="topbar"><span id="breadcrumb"></span><button id="topScan" class="primary" type="button">＋ 新建扫描</button></header>
+    <div class="content">
+      <p id="notice" class="notice" role="status" hidden></p>
+      <section id="home" hidden>
+        <div class="hero"><div><p class="eyebrow">WEB SECURITY WORKSPACE</p><h1>网站安全工作台</h1><p>爬取网页、检查风险，并保留可复核的证据。</p></div><button id="homeDemo" type="button">启动本地演示 ↗</button></div>
+        <div class="metrics" id="metrics"></div>
+        <div class="card"><h2>最近扫描</h2><div id="recent"></div></div>
+      </section>
+      <section id="scan" hidden>
+        <h1>新建扫描</h1><p class="muted">输入域名或网址，按范围抓取并分析页面。</p>
+        <form id="scanForm" class="card stack">
+          <label>目标地址<input name="url" placeholder="https://example.com" required maxlength="2048"></label>
+          <div class="field-grid">
+            <label>最多页面<input name="max_pages" type="number" min="1" max="500" value="120" required></label>
+            <label>爬取深度<input name="max_depth" type="number" min="1" max="6" value="3" required></label>
           </div>
-          <div class="opt">
-            <span class="opt-label">爬取深度</span>
-            <input type="range" id="maxDepth" min="1" max="6" step="1" value="3">
-            <span class="opt-val" id="maxDepthVal">3</span>
-          </div>
-          <label class="check">
-            <input type="checkbox" id="deep">
-            <span>主动 PoC 检测<span class="hint">会向参数发送探测载荷（XSS / SQLi / LFI / 跳转）</span></span>
-          </label>
+          <label class="check"><input name="probe_sensitive" type="checkbox" checked> 检查常见敏感文件和 CORS</label>
+          <label class="check"><input name="deep" type="checkbox"> 深度扫描 · 发送只读测试输入</label>
+          <label class="check"><input name="dynamic" type="checkbox"> 动态网页 · 执行 JavaScript 发现更多入口（最多尝试渲染 25 页）</label>
+          <label class="check"><input name="save_snapshots" type="checkbox"> 本地保留 HTML 文本快照（每次最多 16 MiB）</label>
+          <label class="check"><input name="authorized" type="checkbox" required> 我拥有目标或已获得授权</label>
+          <div><button class="primary" type="submit">开始扫描</button></div>
+        </form>
+        <div class="card split-action"><div><h2>本地靶站演示</h2><p class="muted">自动启动靶站、扫描并保存快照。演示结束后自动关闭靶站。</p></div><div class="actions"><button id="staticDemo">普通爬取</button><button id="dynamicDemo" class="primary">动态爬取</button></div></div>
+        <div id="task" class="card" hidden></div>
+      </section>
+      <section id="map" hidden>
+        <h1>网站地图</h1><p class="muted">查看实际访问的页面、发现的表单和关联问题。</p>
+        <div class="toolbar"><label>扫描记录 <select id="mapScan"></select></label></div>
+        <div class="panes"><div class="card pane"><h2>已访问页面</h2><div id="tree"></div></div><div class="card pane" id="pageDetail"></div></div>
+      </section>
+      <section id="findings" hidden>
+        <h1>漏洞复核</h1><p class="muted">把扫描器的判断、原始证据和你的复核记录放在一起。</p>
+        <div class="toolbar">
+          <label>扫描记录 <select id="findingScan"></select></label>
+          <label>严重程度 <select id="severity"><option value="">全部</option></select></label>
+          <label>判定 <select id="assessment"><option value="">全部</option><option>已验证</option><option>疑似</option><option>配置建议</option></select></label>
+          <label>网址或名称 <input id="filter" placeholder="搜索发现"></label>
         </div>
-
-        <label class="check auth">
-          <input type="checkbox" id="authorized">
-          <span>我确认对该目标拥有所有权，或已获得书面授权，并承担由此产生的一切责任</span>
-        </label>
-        <div class="warn" id="warnBox"></div>
-      </div>
-
-      <!-- 进度 -->
-      <div class="card progress-card hidden" id="progressCard">
-        <div class="progress-head">
-          <b id="progressTitle">正在扫描</b>
-          <span id="progressPct">0%</span>
-        </div>
-        <div class="bar"><div class="bar-fill" id="barFill"></div></div>
-        <div class="stages" id="stages"></div>
-        <div class="progress-msg" id="progressMsg">准备中…</div>
-      </div>
-
-      <!-- 报告 -->
-      <div id="reportArea"></div>
-    </section>
-
-    <!-- ============ 历史 ============ -->
-    <section class="view hidden" id="view-history">
-      <header class="page-head">
-        <h1>扫描记录</h1>
-        <p>历史任务保存在本地 SQLite，点击可重新查看报告。</p>
-      </header>
-      <div id="historyList" class="history"></div>
-    </section>
-
-    <!-- ============ 关于 ============ -->
-    <section class="view hidden" id="view-about">
-      <header class="page-head">
-        <h1>关于</h1>
-        <p>WebScan 1.0 · Web 漏洞扫描系统（课程课题 30）</p>
-      </header>
-      <div class="card prose">
-        <h3>能做什么</h3>
-        <ul>
-          <li>同源爬取站点结构（URL、表单、参数），默认限速 6 请求/秒</li>
-          <li>被动分析：安全响应头、Cookie 属性、版本泄露、目录列表、报错信息、注释、混合内容、表单安全</li>
-          <li>只读探测：Git / .env / 备份包等敏感文件（带内容指纹，避免 404 误报）、CORS 配置</li>
-          <li>主动 PoC（需显式开启）：反射型 XSS、错误型 SQL 注入、路径穿越、开放重定向，用不同输入复测，XSS 回显保留为疑似</li>
-          <li>健康参考分：按已发现的问题计算，受扫描覆盖范围影响</li>
-        </ul>
-        <h3>不做什么</h3>
-        <ul>
-          <li>不利用漏洞、不写入、不删除、不爆破密码</li>
-          <li>不扫描未授权目标；任务必须勾选授权确认</li>
-          <li>不实现绕过 WAF 的对抗性混淆</li>
-        </ul>
-        <h3>风险模型</h3>
-        <p><code>P = 1 - Π(1 - base[severity] × confidence)</code>，健康分 = <code>100 × (1 - P)</code>。
-           base 取值：严重 0.35 / 高危 0.20 / 中危 0.08 / 低危 0.02。</p>
-      </div>
-    </section>
+        <div class="panes"><div class="card pane"><h2>发现项</h2><div id="findingList"></div></div><div class="card pane" id="findingDetail"></div></div>
+      </section>
+      <section id="checkup" hidden>
+        <h1>网站安全体检</h1><p class="muted">仅请求站点根地址，查看证书、HTTPS 跳转和安全响应头。</p>
+        <form class="card stack" id="checkupForm">
+          <label>域名或网址<input name="url" placeholder="example.com" required maxlength="2048"></label>
+          <label class="check"><input name="authorized" type="checkbox" required> 我拥有目标或已获得授权</label>
+          <div><button class="primary" type="submit">开始体检</button></div>
+        </form>
+        <div id="checkupResult"></div>
+      </section>
+      <section id="history" hidden>
+        <h1>扫描历史</h1><p class="muted">从历史记录打开网站地图、复核发现或导出报告。</p>
+        <div class="card" id="historyList"></div>
+      </section>
+    </div>
   </main>
-</div>
-<script src="/static/app.js"></script>
 </body>
 </html>

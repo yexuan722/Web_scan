@@ -5,6 +5,9 @@
 产物：dist/WebScan/WebScan.exe
 """
 
+from pathlib import Path
+import os
+
 from PyInstaller.utils.hooks import collect_submodules
 
 hidden = []
@@ -13,6 +16,12 @@ datas = [
     ("assets/webscan.ico", "assets"),
 ]
 binaries = []
+browser_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", Path(SPECPATH) / "build" / "pw-browsers"))
+browser_dirs = sorted(browser_path.glob("chromium_headless_shell-*"))
+if not browser_dirs:
+    raise SystemExit("Run scripts/build_exe.ps1 to install the Chromium headless shell first.")
+for browser_dir in browser_dirs:
+    datas.append((str(browser_dir), f"pw-browsers/{browser_dir.name}"))
 
 # 托盘后端是运行时动态导入的
 hidden += collect_submodules("pystray")

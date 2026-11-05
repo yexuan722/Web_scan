@@ -19,6 +19,7 @@ PAGE = """<!DOCTYPE html>
 <nav>
   <a href="/">首页</a>
   <a href="/search?q=book">搜索</a>
+  <a href="/dynamic">动态页面演示</a>
   <a href="/item?id=1">商品</a>
   <a href="/download?file=readme.txt">下载</a>
   <a href="/redirect?next=/item?id=2">跳转</a>
@@ -78,6 +79,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(PAGE)
 
         # 1) 反射型 XSS：原样回显，不转义
+        if path == "/dynamic":
+            return self._send("""<html><body><h1>动态页面演示</h1><div id="mount"></div>
+<script>
+setTimeout(() => {
+    const link = document.createElement("a");
+    link.href = ["/", "browser", "-only"].join("");
+    link.textContent = "JavaScript 生成的页面入口";
+    document.getElementById("mount").appendChild(link);
+}, 120);
+</script></body></html>""")
+
+        if path == "/browser-only":
+            return self._send("<html><body><h1>只有动态爬虫发现的页面</h1></body></html>")
+
         if path == "/search":
             return self._send(
                 f"<html><head><title>搜索结果</title></head><body>"

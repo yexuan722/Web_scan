@@ -49,7 +49,16 @@ async def run_scan(
             concurrency=options.concurrency,
             rps=options.rps,
         )
+        renderer = None
         try:
+            if options.dynamic:
+                from .renderer import Renderer
+
+                renderer = Renderer()
+                try:
+                    await renderer.start()
+                except Exception as exc:
+                    raise RuntimeError("动态浏览器启动失败，请检查打包文件或运行 playwright install chromium --only-shell") from exc
             # ---------------- 1. 爬取 ----------------
             await emit({"type": "stage", "stage": "crawl", "message": "正在爬取站点…"})
 
@@ -62,21 +71,22 @@ async def run_scan(
                     "message": f"已抓取 {done}/{total}：{page.url[:90]}",
                 })
 
+            async def render(page):
+                return await renderer.render(page, fetcher)
+
             pages, skipped = await crawl(
                 target,
                 fetcher,
                 max_pages=options.max_pages,
                 max_depth=options.max_depth,
                 on_page=on_page,
+                render=render if renderer else None,
             )
             if not pages or not any(p.ok for p in pages):
                 err = pages[0].error if pages else "无法访问目标"
                 raise RuntimeError(f"目标不可达或返回异常：{err}")
 
-            store.add_pages(
-                scan.id,
-                [(p.url, p.method, p.status, p.length, p.elapsed_ms) for p in pages],
-            )
+            store.add_pages(scan.id, pages, save_snapshots=options.save_snapshots)
 
             # ---------------- 2. 被动分析 ----------------
             await emit({"type": "stage", "stage": "analyze", "message": "正在分析页面与响应头…"})
@@ -141,7 +151,11 @@ async def run_scan(
                     findings.setdefault(f.key(), f)
         finally:
             requests_made = fetcher.requests
-            await fetcher.close()
+            try:
+                if renderer:
+                    await renderer.close()
+            finally:
+                await fetcher.close()
 
         # ---------------- 5. 评分与落库 ----------------
         items = sorted(findings.values(), key=lambda f: (SEV_RANK.get(f.severity, 9), f.rule_id))
@@ -155,6 +169,8 @@ async def run_scan(
         scan.finished_at = time.time()
         scan.stats = {
             "pages": len(pages),
+            "rendered_pages": renderer.rendered if renderer else 0,
+            "render_attempts": renderer.attempted if renderer else 0,
             "truncated_pages": sum(p.truncated for p in pages),
             "skipped": len(skipped),
             "requests": requests_made,

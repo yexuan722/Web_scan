@@ -6,7 +6,7 @@
 
 ## 1. 项目是什么
 
-**WebScan 1.0** —— Web 漏洞扫描器（课程课题 30：网站漏洞扫描系统）。
+**WebScan 1.1** —— Web 漏洞扫描器（课程课题 30：网站漏洞扫描系统）。
 
 输入一个**已授权**的网址 → 爬取攻击面 → 被动规则 + 只读探测 + 主动 PoC →
 输出分级漏洞清单 + 可复算的健康评分 + 可导出的报告。
@@ -38,7 +38,9 @@ webscan/
 ├── models.py      Page / Form / Finding / ScanResult
 ├── fetcher.py     httpx 封装：并发、每主机限速、响应截断
 ├── crawler.py     同源 BFS、URL 规范化、破坏性路径排除
-├── storage.py     SQLite（连接短开短闭）
+├── storage.py     SQLite（扫描历史、页面、快照、人工复核）
+├── renderer.py    隔离的 Chromium 渲染（复用受限 HTTP 抓取层）
+├── checkup.py     证书、HTTPS 升级和响应头体检
 ├── scoring.py     noisy-OR 健康评分
 ├── report.py      HTML / Markdown / JSON 导出
 ├── engine.py      编排：爬取 → 被动 → 探测 → 主动 → 评分
@@ -127,7 +129,7 @@ python -m PyInstaller --noconfirm --clean webscan.spec
 
 - 只对**自己拥有**或**已获书面授权**的目标扫描。代码里有强制授权闸门，不要移除。
 - 不实现漏洞利用、写入/删除、密码爆破、WAF 对抗、端口扫描。
-- 扫描结果可能含敏感信息，只存本地。
+- 扫描结果可能含敏感信息，只存本地。快照按扫描开启，导出为纯文本，不能把目标网页直接渲染进工作台窗口。
 
 ---
 
@@ -139,10 +141,8 @@ HTML/MD/JSON 报告、Qt 桌面窗口、托盘、单实例、打包。
 **未做（按优先级）**：
 
 1. POST 表单与登录态（覆盖率提升最大）
-2. Playwright 渲染分支（SPA 站点现在只能看到骨架）
-3. 误报白名单（标记后落库，下次不报）
-4. 报告按 OWASP Top 10 归类
-5. 安装包（Inno Setup）与代码签名
+2. 报告按 OWASP Top 10 归类
+3. 安装包（Inno Setup）与代码签名
 
-**验证基线**：对 `labs/vuln_app.py` 全量扫描应得到 13 条发现、评分 10/100。
+**验证基线**：对 `labs/vuln_app.py` 全量扫描应得到 13 条发现、评分 10/100；动态演示会比普通演示多发现 /browser-only。
 改动后请跑一遍，条数变化要能解释。

@@ -59,7 +59,7 @@ def run(url: str, width: int = 1400, height: int = 900) -> bool:
         from PySide6.QtGui import QIcon
         from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
         from PySide6.QtWebEngineWidgets import QWebEngineView
-        from PySide6.QtWidgets import QApplication, QMainWindow
+        from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow
     except Exception:
         log.exception("Qt 组件导入失败")
         return False
@@ -105,6 +105,20 @@ def run(url: str, width: int = 1400, height: int = 900) -> bool:
         win.resize(width, height)
         win.setMinimumSize(1100, 700)
         win.setCentralWidget(view)
+
+        def save_download(download):
+            destination, _ = QFileDialog.getSaveFileName(
+                win, "保存 WebScan 导出文件", str(Path.home() / download.suggestedFileName())
+            )
+            if not destination:
+                download.cancel()
+                return
+            path = Path(destination)
+            download.setDownloadDirectory(str(path.parent))
+            download.setDownloadFileName(path.name)
+            download.accept()
+
+        profile.downloadRequested.connect(save_download)
         win.show()
 
         log.info("原生窗口已打开：%s", url)

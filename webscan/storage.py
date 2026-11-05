@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import config
-from .models import Finding, ScanResult
+from .models import Page, ScanResult
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
@@ -55,6 +55,17 @@ CREATE TABLE IF NOT EXISTS pages (
     elapsed_ms INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pages_scan ON pages(scan_id);
+CREATE TABLE IF NOT EXISTS page_details (
+    page_id INTEGER PRIMARY KEY,
+    scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    details TEXT NOT NULL,
+    source TEXT,
+    rendered TEXT
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    finding_id INTEGER PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
+    status TEXT NOT NULL
+);
 """
 
 
@@ -126,14 +137,17 @@ class Store:
             data["options"] = json.loads(data.get("options") or "{}")
             data["stats"] = json.loads(data.get("stats") or "{}")
             frows = con.execute(
-                "SELECT * FROM findings WHERE scan_id=?" " ORDER BY CASE severity"
-                " WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2"
-                " WHEN 'low' THEN 3 ELSE 4 END, id",
+                "SELECT f.*, r.status AS review FROM findings AS f"
+                " LEFT JOIN reviews AS r ON r.finding_id=f.id WHERE f.scan_id=?"
+                " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1"
+                " WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, f.id",
                 (scan_id,),
             ).fetchall()
             data["findings"] = []
             for row in frows:
                 finding = dict(row)
+                finding["request_snippet"] = finding.pop("req")
+                finding["response_snippet"] = finding.pop("resp")
                 if finding["rule_id"] in {"SEC-HEADERS", "CSP-WEAK", "HSTS-MISSING",
                                          "COOKIE-FLAGS", "CORS-WILDCARD", "BANNER"}:
                     finding["assessment"] = "配置建议"
@@ -162,10 +176,68 @@ class Store:
             con.execute("DELETE FROM pages WHERE scan_id=?", (scan_id,))
             con.execute("DELETE FROM scans WHERE id=?", (scan_id,))
 
-    def add_pages(self, scan_id: str, pages: list[tuple[str, str, int, int, int]]) -> None:
+    def add_pages(self, scan_id: str, pages: list[Page], *, save_snapshots: bool = False) -> None:
+        budget = 16 * 1024 * 1024
         with self._conn() as con:
-            con.executemany(
-                "INSERT INTO pages (scan_id, url, method, status, length, elapsed_ms)"
-                " VALUES (?,?,?,?,?,?)",
-                [(scan_id, *p) for p in pages],
+            for page in pages:
+                cursor = con.execute(
+                    "INSERT INTO pages (scan_id, url, method, status, length, elapsed_ms)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (scan_id, page.url, page.method, page.status, page.length, page.elapsed_ms),
+                )
+                details = {
+                    "requested_url": page.requested_url, "error": page.error,
+                    "truncated": page.truncated, "rendered": page.rendered_html is not None,
+                    "forms": [
+                        {"action": form.action, "method": form.method,
+                         "fields": [{"name": field.name, "type": field.type} for field in form.fields]}
+                        for form in page.forms
+                    ],
+                }
+                source = rendered = None
+                if save_snapshots and page.ok and page.content_type.split(";", 1)[0].strip().lower() in (
+                    "text/html", "application/xhtml+xml"
+                ):
+                    source, rendered = page.body, page.rendered_html
+                    size = len(source.encode("utf-8")) + len((rendered or "").encode("utf-8"))
+                    if size <= budget:
+                        budget -= size
+                    else:
+                        source = rendered = None
+                con.execute(
+                    "INSERT INTO page_details (page_id, scan_id, details, source, rendered)"
+                    " VALUES (?,?,?,?,?)",
+                    (cursor.lastrowid, scan_id, json.dumps(details, ensure_ascii=False), source, rendered),
+                )
+
+    def list_pages(self, scan_id: str) -> list[dict[str, Any]]:
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT p.rowid AS id, p.*, d.details, d.source IS NOT NULL AS has_source,"
+                " d.rendered IS NOT NULL AS has_rendered FROM pages AS p LEFT JOIN page_details AS d"
+                " ON d.page_id=p.rowid AND d.scan_id=p.scan_id WHERE p.scan_id=? ORDER BY p.rowid",
+                (scan_id,),
             )
+            pages = []
+            for row in rows:
+                page = dict(row)
+                page.update(json.loads(page.pop("details") or "{}"))
+                pages.append(page)
+            return pages
+
+    def snapshot(self, scan_id: str, page_id: int, rendered: bool) -> str | None:
+        column = "rendered" if rendered else "source"
+        with self._conn() as con:
+            row = con.execute(
+                f"SELECT {column} FROM page_details WHERE scan_id=? AND page_id=?", (scan_id, page_id)
+            ).fetchone()
+            return row[0] if row else None
+
+    def review_finding(self, scan_id: str, finding_id: int, status: str) -> bool:
+        with self._conn() as con:
+            cursor = con.execute(
+                "INSERT INTO reviews (finding_id, status) SELECT id, ? FROM findings"
+                " WHERE id=? AND scan_id=? ON CONFLICT(finding_id) DO UPDATE SET status=excluded.status",
+                (status, finding_id, scan_id),
+            )
+            return cursor.rowcount == 1

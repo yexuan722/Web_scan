@@ -1,4 +1,4 @@
-# 运行依赖（服务层用标准库，前端是静态文件，只有 HTTP 客户端是第三方）
+# 运行依赖（服务层用标准库，前端是静态文件）
 httpx>=0.27,<1.0
 
 # 托盘图标
@@ -7,6 +7,9 @@ pillow>=10.0
 
 # 原生窗口（Qt WebEngine / Chromium 内核）
 PySide6>=6.6
+
+# 可选动态爬取，Windows 绿色版自带对应的 Chromium
+playwright==1.64.1
 
 # 打包（仅构建 exe 时需要）
 # pyinstaller>=6.0

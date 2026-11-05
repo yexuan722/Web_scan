@@ -50,6 +50,8 @@ class Page:
     forms: list[Form] = field(default_factory=list)
     links: list[str] = field(default_factory=list)
     set_cookies: list[str] = field(default_factory=list)
+    raw_body: bytes = b""
+    rendered_html: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -115,6 +117,8 @@ class ScanOptions:
     max_depth: int = 3
     deep: bool = False              # 主动 PoC（需授权）
     probe_sensitive: bool = True    # 只读敏感路径探测
+    dynamic: bool = False
+    save_snapshots: bool = False
     concurrency: int = 8
     rps: float = 6.0
 

@@ -127,16 +127,14 @@ class _Extractor(HTMLParser):
             self._form = None
 
 
-def extract(page: Page) -> tuple[list[str], list[Form]]:
+def extract(page: Page, markup: str | None = None) -> tuple[list[str], list[Form]]:
     """从 HTML 页里抽链接与表单。非 HTML 直接返回空。"""
     ctype = page.content_type
     if ctype and "html" not in ctype and "xml" not in ctype:
         return [], []
-    if "<html" not in page.body[:2000].lower() and "<form" not in page.body[:2000].lower():
-        return [], []
     parser = _Extractor(page.url)
     try:
-        parser.feed(page.body)
+        parser.feed(page.body if markup is None else markup)
     except Exception:
         return [], []
     return parser.links, parser.forms
@@ -150,6 +148,7 @@ async def crawl(
     max_depth: int = config.DEFAULT_MAX_DEPTH,
     on_page: Callable[[Page, int, int], Awaitable[None]] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    render: Callable[[Page], Awaitable[str | None]] | None = None,
 ) -> tuple[list[Page], list[str]]:
     """广度优先抓取。返回 (页面列表, 被跳过的 URL 列表)。"""
     start = normalize_url(start_url) or start_url
@@ -174,6 +173,12 @@ async def crawl(
                 if not page.ok or not 200 <= page.status < 300:
                     continue
                 links, forms = extract(page)
+                if render and page.content_type.partition(";")[0].lower().strip() in ("text/html", "application/xhtml+xml"):
+                    page.rendered_html = await render(page)
+                    if page.rendered_html:
+                        rendered_links, rendered_forms = extract(page, page.rendered_html)
+                        links = list(dict.fromkeys(links + rendered_links))
+                        forms += [form for form in rendered_forms if form not in forms]
                 page.links = links
                 page.forms = forms
                 if depth >= max_depth:

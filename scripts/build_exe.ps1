@@ -8,7 +8,8 @@ $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
 try {
     if (-not $SkipInstall) {
-        python -m pip install --upgrade pyinstaller pystray pillow PySide6
+        python -m pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
+        if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
     }
 
     # 图标（已存在则跳过）
@@ -16,7 +17,17 @@ try {
         python scripts/make_icon.py
     }
 
-    python -m PyInstaller --noconfirm --clean webscan.spec
+    $previousBrowserPath = $env:PLAYWRIGHT_BROWSERS_PATH
+    try {
+        $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $root "build\pw-browsers"
+        python -m playwright install chromium --only-shell
+        if ($LASTEXITCODE -ne 0) { throw "Chromium installation failed" }
+        python -m PyInstaller --noconfirm --clean webscan.spec
+        if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
+    }
+    finally {
+        $env:PLAYWRIGHT_BROWSERS_PATH = $previousBrowserPath
+    }
 
     Write-Host ""
     Write-Host "产物：$root\dist\WebScan\WebScan.exe" -ForegroundColor Green
