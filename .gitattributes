@@ -1,0 +1,7 @@
+# 统一行尾：代码用 LF，二进制不转换
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.jpg binary
+*.zip binary
