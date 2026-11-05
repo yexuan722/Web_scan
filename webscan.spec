@@ -7,6 +7,7 @@
 
 from pathlib import Path
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_submodules
 
@@ -66,6 +67,11 @@ a = Analysis(
     ],
     noarchive=False,
 )
+
+# Qt 依赖 Windows 自带的 ICU 接口。PATH 上其他应用的 ICU 可能只有带版本后缀的符号。
+if sys.platform == "win32":
+    system_icu = {"icu.dll", "icuin.dll", "icuuc.dll"}
+    a.binaries = [entry for entry in a.binaries if entry[0].lower() not in system_icu]
 
 pyz = PYZ(a.pure)
 
