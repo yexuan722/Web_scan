@@ -5,12 +5,14 @@ from __future__ import annotations
 import posixpath
 import re
 from html.parser import HTMLParser
-from typing import Awaitable, Callable
-from urllib.parse import parse_qsl, urljoin, urlencode, urlsplit, urlunsplit
+from typing import TYPE_CHECKING, Awaitable, Callable
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from . import config
-from .fetcher import Fetcher
 from .models import Form, FormField, Page
+
+if TYPE_CHECKING:
+    from .fetcher import Fetcher
 
 # 不值得抓取的静态资源
 SKIP_EXT = {
@@ -36,10 +38,12 @@ def normalize_url(url: str, base: str | None = None) -> str | None:
     if scheme not in config.ALLOWED_SCHEMES:
         return None
     host = (parts.hostname or "").lower()
-    if not host:
+    if not host or parts.username is not None:
         return None
     port = parts.port
-    netloc = host if port in (None, 80, 443) else f"{host}:{port}"
+    default_port = 443 if scheme == "https" else 80
+    address = f"[{host}]" if ":" in host else host
+    netloc = address if port in (None, default_port) else f"{address}:{port}"
     path = re.sub(r"/{2,}", "/", parts.path or "/")
     if not path.startswith("/"):
         path = "/" + path
@@ -53,20 +57,25 @@ def normalize_url(url: str, base: str | None = None) -> str | None:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
-def same_site(a: str, b: str, allow_http_downgrade: bool = False) -> bool:
+def same_site(a: str, b: str) -> bool:
+    """同主机、协议和端口，仅允许默认端口的 HTTP → HTTPS 升级。"""
     pa, pb = urlsplit(a), urlsplit(b)
-    if pa.hostname != pb.hostname:
+    if pa.hostname != pb.hostname or pb.scheme not in config.ALLOWED_SCHEMES:
         return False
-    if pa.port not in (None, 80, 443) or pb.port not in (None, 80, 443):
-        return pa.port == pb.port
+    port_a = pa.port if pa.port is not None else (443 if pa.scheme == "https" else 80)
+    port_b = pb.port if pb.port is not None else (443 if pb.scheme == "https" else 80)
     if pa.scheme == pb.scheme:
-        return True
-    return pa.scheme == "http" and pb.scheme == "https"
+        return port_a == port_b
+    return pa.scheme == "http" and port_a == 80 and pb.scheme == "https" and port_b == 443
+
+
+def dangerous_path(url: str) -> bool:
+    return bool(_DANGEROUS.search(unquote(urlsplit(url).path)))
 
 
 def skipped_path(url: str) -> bool:
     path = urlsplit(url).path
-    if _DANGEROUS.search(path):
+    if dangerous_path(url):
         return True
     ext = posixpath.splitext(path)[1].lower()
     return ext in SKIP_EXT
@@ -155,22 +164,28 @@ async def crawl(
             break
         level, frontier = frontier, []
         while level and len(pages) < max_pages:
-            chunk, level = level[:batch], level[batch:]
+            size = min(batch, max_pages - len(pages))
+            chunk, level = level[:size], level[size:]
             results = await gather_pages(chunk, fetcher)
             for (url, depth), page in zip(chunk, results):
                 pages.append(page)
                 if on_page:
                     await on_page(page, len(pages), max_pages)
-                if depth >= max_depth or not page.ok:
+                if not page.ok or not 200 <= page.status < 300:
                     continue
                 links, forms = extract(page)
                 page.links = links
                 page.forms = forms
+                if depth >= max_depth:
+                    continue
                 for raw in links:
-                    nxt = normalize_url(raw, page.url)
+                    try:
+                        nxt = normalize_url(raw, page.url)
+                    except ValueError:
+                        continue
                     if not nxt or nxt in seen:
                         continue
-                    if not same_site(start, nxt):
+                    if not same_site(page.url, nxt):
                         continue
                     if skipped_path(nxt):
                         skipped.append(nxt)

@@ -44,7 +44,8 @@ class Page:
     body: str = ""
     content_type: str = ""
     elapsed_ms: int = 0
-    length: int = 0
+    length: int = 0             # 保留的正文大小（字节）
+    truncated: bool = False
     error: str | None = None
     forms: list[Form] = field(default_factory=list)
     links: list[str] = field(default_factory=list)

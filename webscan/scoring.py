@@ -1,7 +1,7 @@
 """健康评分：noisy-OR 模型，可复算、可解释。
 
-P(被攻破) = 1 - Π(1 - base[severity] × confidence)
-健康分 = round(100 × (1 - P))
+风险指数 = 1 - Π(1 - base[severity] × confidence)
+健康参考分 = round(100 × (1 - 风险指数))
 """
 
 from __future__ import annotations

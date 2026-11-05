@@ -45,6 +45,7 @@ async def run_scan(
         await emit({"type": "stage", "stage": "start", "message": f"开始扫描 {target}"})
 
         fetcher = Fetcher(
+            target=target,
             concurrency=options.concurrency,
             rps=options.rps,
         )
@@ -103,9 +104,10 @@ async def run_scan(
             # ---------------- 3. 只读探测 ----------------
             if options.probe_sensitive:
                 await emit({"type": "stage", "stage": "probe", "message": "正在探测敏感文件与 CORS…"})
-                origin = _origin(target)
+                landing = pages[0].url
+                origin = _origin(landing)
                 probed = await probe_sensitive_paths(origin, fetcher)
-                probed += await probe_cors(target, fetcher)
+                probed += await probe_cors(landing, fetcher)
                 for f in probed:
                     findings.setdefault(f.key(), f)
                 await emit({
@@ -153,6 +155,7 @@ async def run_scan(
         scan.finished_at = time.time()
         scan.stats = {
             "pages": len(pages),
+            "truncated_pages": sum(p.truncated for p in pages),
             "skipped": len(skipped),
             "requests": requests_made,
             "elapsed": round(time.monotonic() - started, 1),

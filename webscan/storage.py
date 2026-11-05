@@ -131,7 +131,15 @@ class Store:
                 " WHEN 'low' THEN 3 ELSE 4 END, id",
                 (scan_id,),
             ).fetchall()
-            data["findings"] = [dict(r) for r in frows]
+            data["findings"] = []
+            for row in frows:
+                finding = dict(row)
+                if finding["rule_id"] in {"SEC-HEADERS", "CSP-WEAK", "HSTS-MISSING",
+                                         "COOKIE-FLAGS", "CORS-WILDCARD", "BANNER"}:
+                    finding["assessment"] = "配置建议"
+                else:
+                    finding["assessment"] = "已验证" if finding["verified"] else "疑似"
+                data["findings"].append(finding)
             return data
 
     def list_scans(self, limit: int = 50) -> list[dict[str, Any]]:

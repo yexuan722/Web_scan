@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from . import config
+from .crawler import dangerous_path, same_site
 from .models import Page
 
 
@@ -47,6 +48,7 @@ def _decode(content: bytes, content_type: str) -> str:
 class Fetcher:
     def __init__(
         self,
+        target: str,
         concurrency: int = config.DEFAULT_CONCURRENCY,
         rps: float = config.DEFAULT_RPS,
         timeout: float = config.DEFAULT_TIMEOUT,
@@ -55,10 +57,10 @@ class Fetcher:
         self._sem = asyncio.Semaphore(concurrency)
         self._limiter = RateLimiter(rps)
         self.requests = 0
+        self._target = str(httpx.URL(target))
         self._client = httpx.AsyncClient(
             verify=False,
             timeout=httpx.Timeout(timeout, connect=min(timeout, 6.0)),
-            follow_redirects=True,
             headers={"User-Agent": user_agent, "Accept": "*/*"},
             limits=httpx.Limits(max_connections=concurrency + 4, max_keepalive_connections=concurrency),
         )
@@ -82,31 +84,45 @@ class Fetcher:
         headers: dict[str, str] | None = None,
         follow: bool = True,
     ) -> Page:
-        host = httpx.URL(url).host or ""
         page = Page(url=url, method=method, requested_url=url)
         async with self._sem:
-            await self._limiter.acquire(host)
-            self.requests += 1
             started = time.monotonic()
             try:
-                resp = await self._client.request(
-                    method,
-                    url,
-                    params=params,
-                    data=data,
-                    headers=headers,
-                    follow_redirects=follow,
-                )
-                body = resp.content[: config.MAX_BODY_BYTES]
-                page.status = resp.status_code
-                page.headers = {k.lower(): v for k, v in resp.headers.items()}
-                page.content_type = page.headers.get("content-type", "")
-                page.body = _decode(body, page.content_type)
-                page.length = len(resp.content)
-                page.url = str(resp.url)
-                page.set_cookies = resp.headers.get_list("set-cookie") if hasattr(
-                    resp.headers, "get_list"
-                ) else []
+                request = self._client.build_request(method, url, params=params, data=data, headers=headers)
+                previous_url = self._target
+                for hop in range(21):
+                    request_url = str(request.url)
+                    if (request.url.userinfo or not same_site(self._target, request_url)
+                            or not same_site(previous_url, request_url) or dangerous_path(request_url)):
+                        raise ValueError("已阻止超出授权范围或命中危险路径的请求")
+                    await self._limiter.acquire(request.url.host)
+                    self.requests += 1
+                    response = await self._client.send(request, stream=True, follow_redirects=False)
+                    try:
+                        if follow and response.next_request is not None:
+                            if hop == 20:
+                                raise ValueError("跳转次数超过上限")
+                            previous_url = request_url
+                            request = response.next_request
+                            continue
+
+                        body = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            remaining = config.MAX_BODY_BYTES - len(body)
+                            body.extend(chunk[:remaining])
+                            if len(chunk) > remaining:
+                                page.truncated = True
+                                break
+                        page.status = response.status_code
+                        page.headers = {k.lower(): v for k, v in response.headers.items()}
+                        page.content_type = page.header("content-type")
+                        page.body = _decode(body, page.content_type)
+                        page.length = len(body)
+                        page.url = str(response.url)
+                        page.set_cookies = response.headers.get_list("set-cookie")
+                        break
+                    finally:
+                        await response.aclose()
             except Exception as exc:  # 网络错误不能中断整次扫描
                 page.error = f"{type(exc).__name__}: {exc}"
             page.elapsed_ms = int((time.monotonic() - started) * 1000)

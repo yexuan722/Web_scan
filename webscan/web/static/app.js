@@ -195,7 +195,7 @@ function renderReport(scan) {
     `<span class="chip">页面 <b>${stats.pages ?? 0}</b></span>`,
     `<span class="chip">请求 <b>${stats.requests ?? 0}</b></span>`,
     `<span class="chip">耗时 <b>${stats.elapsed ?? 0}s</b></span>`,
-    `<span class="chip">已验证 <b>${stats.verified ?? 0}</b></span>`,
+    `<span class="chip">正文截断 <b>${stats.truncated_pages ?? 0}</b></span>`,
   ].join("");
 
   const cards = findings
@@ -209,7 +209,7 @@ function renderReport(scan) {
         <summary>
           <span class="badge sev-${f.severity}">${SEV_LABEL[f.severity] || f.severity}</span>
           <span class="f-title">${esc(f.title)}</span>
-          ${f.verified ? '<span class="f-verified">✓ 已验证</span>' : ""}
+          <span class="f-verified">${esc(f.assessment ?? (f.verified ? "已验证" : "疑似"))}</span>
           <span class="f-rule">${esc(f.rule_id)}</span>
         </summary>
         <div class="finding-body">

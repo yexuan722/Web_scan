@@ -5,11 +5,17 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from webscan.crawler import normalize_url, skipped_path  # noqa: E402
-from webscan.models import Finding, Page  # noqa: E402
+from webscan import config  # noqa: E402
+from webscan.crawler import crawl, normalize_url, skipped_path  # noqa: E402
+from webscan.fetcher import Fetcher  # noqa: E402
+from webscan.models import Finding, Form, FormField, Page
+from webscan.rules.active import _redirect, _sqli, _xss, collect_targets  # noqa: E402
 from webscan.rules.passive import analyze_host, analyze_page  # noqa: E402
 from webscan.scoring import compute_score  # noqa: E402
 
@@ -107,6 +113,120 @@ class TestEvidenceInvariant(unittest.TestCase):
         )
         self.assertTrue(f.evidence)
         self.assertTrue(f.verified)
+
+
+class TestScanBoundaries(unittest.IsolatedAsyncioTestCase):
+    async def test_checks_each_redirect_before_sending(self) -> None:
+        requests = []
+
+        def respond(request):
+            requests.append(str(request.url))
+            destination = {
+                "http://example.test/": "https://example.test/next",
+                "https://example.test/next": "https://other.test/",
+            }[str(request.url)]
+            return httpx.Response(302, headers={"Location": destination})
+
+        async with Fetcher("http://example.test/", rps=0) as fetcher:
+            await fetcher._client.aclose()
+            fetcher._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+            self.assertFalse((await fetcher.fetch("http://example.test/")).ok)
+            self.assertFalse((await fetcher.fetch("https://example.test:80/")).ok)
+            self.assertFalse((await fetcher.fetch("https://example.test/%64elete")).ok)
+            self.assertEqual(fetcher.requests, 2)
+        self.assertEqual(requests, ["http://example.test/", "https://example.test/next"])
+
+    async def test_body_limit_stops_reading_stream(self) -> None:
+        class Body(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"x" * config.MAX_BODY_BYTES
+                yield b"x"
+                self.fail_if_read_past_limit()
+
+            def fail_if_read_past_limit(self):
+                raise AssertionError("stream was read past the limit")
+
+        def respond(request):
+            return httpx.Response(200, stream=Body())
+
+        async with Fetcher("https://example.test/", rps=0) as fetcher:
+            await fetcher._client.aclose()
+            fetcher._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+            page = await fetcher.fetch("https://example.test/")
+        self.assertTrue(page.ok)
+        self.assertTrue(page.truncated)
+        self.assertEqual(page.length, config.MAX_BODY_BYTES)
+
+    async def test_page_limit_and_forms_at_max_depth(self) -> None:
+        class FakeFetcher:
+            async def fetch(self, url):
+                if url.endswith("/"):
+                    links = "".join(f'<a href="/{i}">link</a>' for i in range(12))
+                    return _page(url=url, body=f"<html>{links}</html>")
+                return _page(url=url, body='<form action="/search"><input name="q"></form>')
+
+        pages, _ = await crawl("https://example.test/", FakeFetcher(), max_pages=2, max_depth=1)
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(pages[1].forms[0].fields[0].name, "q")
+
+    def test_forms_outside_scope_are_not_queued(self) -> None:
+        actions = (
+            "https://other.test/search",
+            "https://example.test:8443/search",
+            "http://example.test/search",
+            "https://example.test/delete",
+            "https://example.test/search",
+        )
+        page = _page(url="https://example.test/", forms=[
+            Form(action=action, fields=[FormField("q")]) for action in actions
+        ])
+        self.assertEqual([target["url"] for target in collect_targets([page])], [actions[-1]])
+
+
+class TestActiveEvidence(unittest.IsolatedAsyncioTestCase):
+    target = {"url": "https://example.test/?q=book", "param": "q", "value": "book"}
+
+    async def test_only_html_reflection_is_reported_as_suspected(self) -> None:
+        class Reflect:
+            def __init__(self, content_type):
+                self.content_type = content_type
+                self.values = []
+
+            async def fetch(self, url, *, follow):
+                value = parse_qs(urlsplit(url).query)["q"][0]
+                self.values.append(value)
+                return _page(url=url, body=value, content_type=self.content_type)
+
+        self.assertEqual(await _xss(self.target, Reflect("text/plain"), ""), [])
+        html = Reflect("text/html; charset=utf-8")
+        finding, = await _xss(self.target, html, "")
+        self.assertFalse(finding.verified)
+        self.assertEqual(len(set(html.values)), 2)
+
+    async def test_sqli_requires_distinct_payloads_with_the_same_error(self) -> None:
+        class Database:
+            def __init__(self, accepted):
+                self.accepted = accepted
+
+            async def fetch(self, url, *, follow):
+                suffix = parse_qs(urlsplit(url).query)["q"][0][len("book"):]
+                if suffix in self.accepted:
+                    return _page(url=url, body="SQLSTATE[42000]", status=500)
+                return _page(url=url)
+
+        second, third = config.SQLI_ERROR_PAYLOADS[1:]
+        self.assertEqual(await _sqli(self.target, Database({second}), ""), [])
+        finding, = await _sqli(self.target, Database({second, third}), "")
+        self.assertTrue(finding.verified)
+        self.assertEqual(await _sqli(self.target, Database({second, third}), "SQLSTATE[42000]"), [])
+
+    async def test_redirect_checks_destination_host_not_path_text(self) -> None:
+        class LocalRedirect:
+            async def fetch(self, url, *, follow):
+                value = parse_qs(urlsplit(url).query)["q"][0]
+                return _page(url=url, status=302, headers={"location": "/next?url=" + value})
+
+        self.assertEqual(await _redirect(self.target, LocalRedirect()), [])
 
 
 if __name__ == "__main__":

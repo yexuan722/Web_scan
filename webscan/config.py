@@ -73,7 +73,7 @@ DEFAULT_MAX_DEPTH = 3
 DEFAULT_CONCURRENCY = 8
 DEFAULT_RPS = 6.0              # 每主机请求速率上限
 DEFAULT_TIMEOUT = 10.0
-MAX_BODY_BYTES = 512 * 1024    # 单页最多读 512KB
+MAX_BODY_BYTES = 512 * 1024    # 单页最多保留 512 KiB 正文
 
 # 绝不自动访问的路径（避免踢会话 / 删数据 / 下单）
 DANGEROUS_PATH_PATTERN = (
@@ -169,8 +169,6 @@ GRADE_BANDS = [
 # --------------------------------------------------------------------------
 # 主动 PoC
 # --------------------------------------------------------------------------
-XSS_TOKEN = "ws7f2a"
-XSS_PAYLOAD = f"<script>alert('{XSS_TOKEN}')</script>"
 
 SQLI_ERROR_PAYLOADS = ("'", '"', "')")
 SQLI_ERROR_SIGNATURES = (

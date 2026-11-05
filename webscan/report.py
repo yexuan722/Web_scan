@@ -34,7 +34,7 @@ def to_markdown(data: dict[str, Any]) -> str:
         "",
         f"- 目标：{target}",
         f"- 扫描时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(data.get('started_at', 0)))}",
-        f"- 健康评分：**{data.get('score', 0)} / 100**（{data.get('grade_label', '')}）",
+        f"- 健康参考分：**{data.get('score', 0)} / 100**（{data.get('grade_label', '')}）",
         f"- 发现总数：{len(data.get('findings', []))}",
         "",
         "## 风险分布",
@@ -53,7 +53,7 @@ def to_markdown(data: dict[str, Any]) -> str:
         lines += [
             f"### {i}. [{SEV_LABEL.get(f['severity'], f['severity'])}] {f['title']}",
             "",
-            f"- 规则：`{f['rule_id']}`　置信度：{f['confidence']}　已验证：{'是' if f['verified'] else '否'}",
+            f"- 规则：`{f['rule_id']}`　置信度：{f['confidence']}　判定：{f.get('assessment', '已验证' if f['verified'] else '疑似')}",
             f"- 位置：`{f['url']}`" + (f"　参数：`{f['param']}`" if f.get("param") else ""),
             f"- 说明：{f['detail']}",
             f"- 修复建议：{f['remediation']}",
@@ -101,7 +101,7 @@ def to_html(data: dict[str, Any]) -> str:
       </div>
       <div class="meta">位置 <code>{_esc(f['url'])}</code>
         {(' · 参数 <code>' + _esc(f['param']) + '</code>') if f.get('param') else ''}
-        · 置信度 {f['confidence']} · {'已验证' if f['verified'] else '未验证'}</div>
+        · 置信度 {f['confidence']} · {_esc(f.get('assessment', '已验证' if f['verified'] else '疑似'))}</div>
       <p>{_esc(f['detail'])}</p>
       <div class="fix"><b>修复建议：</b>{_esc(f['remediation'])}</div>
       {ev}

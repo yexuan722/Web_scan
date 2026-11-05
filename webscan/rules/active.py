@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import re
+import secrets
 from typing import Awaitable, Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from .. import config
+from ..crawler import dangerous_path, same_site
 from ..fetcher import Fetcher
 from ..models import Finding, Page
 
@@ -52,12 +54,16 @@ def collect_targets(pages: list[Page], limit: int = config.ACTIVE_MAX_TARGETS) -
         for k, v in parse_qsl(parts.query, keep_blank_values=True):
             add(base_url, k, v, "query")
         for form in page.forms:
-            if form.method.upper() != "GET":
+            action = form.action or page.url
+            try:
+                if form.method.upper() != "GET" or not same_site(page.url, action) or dangerous_path(action):
+                    continue
+            except ValueError:
                 continue
             for f in form.fields:
                 if f.type.lower() in ("submit", "button", "file", "image"):
                     continue
-                add(form.action or page.url, f.name, f.value or "1", "form")
+                add(action, f.name, f.value or "1", "form")
     return targets[:limit]
 
 
@@ -75,11 +81,8 @@ async def run_active_tests(
     targets = collect_targets(pages, limit)
     baseline: dict[str, Page] = {}
     for p in pages:
-        if not p.ok:
-            continue
-        baseline[p.url] = p
-        if p.requested_url:
-            baseline.setdefault(p.requested_url, p)
+        if p.ok:
+            baseline[p.url] = p
     out: list[Finding] = []
     sem = asyncio.Semaphore(4)
     done = 0
@@ -89,13 +92,17 @@ async def run_active_tests(
         nonlocal done
         async with sem:
             found: list[Finding] = []
-            base = baseline.get(t["url"])
-            base_body = base.body if base else ""
             try:
-                found += await _xss(t, fetcher, base_body)
-                found += await _sqli(t, fetcher, base_body)
-                found += await _lfi(t, fetcher, base_body)
-                found += await _redirect(t, fetcher)
+                baseline_url = _with_param(t["url"], t["param"], t["value"])
+                base = baseline.get(baseline_url)
+                if base is None:
+                    base = await fetcher.fetch(baseline_url, follow=False)
+                if base.ok and 200 <= base.status < 300:
+                    found += await _xss(t, fetcher, base.body)
+                    found += await _sqli(t, fetcher, base.body)
+                    found += await _lfi(t, fetcher, base.body)
+                if base.ok:
+                    found += await _redirect(t, fetcher)
             except Exception:
                 pass
             done += 1
@@ -111,33 +118,34 @@ async def run_active_tests(
 
 # ----------------------------------------------------------------------
 async def _xss(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
-    payload = config.XSS_PAYLOAD
-    probe = f"{t['value']}{payload}" if t["value"] else payload
-    url = _with_param(t["url"], t["param"], probe)
-    page = await fetcher.fetch(url, follow=False)
-    if page.error or 300 <= page.status < 400:
-        return []
-    if payload not in page.body:
-        return []
+    for _ in range(2):
+        payload = f"<script>alert('{secrets.token_hex(8)}')</script>"
+        url = _with_param(t["url"], t["param"], t["value"] + payload)
+        page = await fetcher.fetch(url, follow=False)
+        media_type = page.content_type.partition(";")[0].strip().lower()
+        if (not page.ok or not 200 <= page.status < 300
+                or media_type not in ("text/html", "application/xhtml+xml")
+                or payload in base_body or payload not in page.body):
+            return []
     idx = page.body.find(payload)
     return [
         Finding(
             rule_id="XSS-REFLECT",
-            title="反射型 XSS（参数回显未编码）",
+            title="疑似反射型 XSS（脚本标签原样回显）",
             severity="high",
             category="注入漏洞",
             url=url,
             param=t["param"],
             detail=(
-                f"参数 {t['param']} 的值被原样反射进响应且 < > 未被转义，"
-                "浏览器会把注入内容当作脚本执行。"
+                f"参数 {t['param']} 在两次测试中均将不同的脚本标签原样写入 HTML。"
+                "需要结合页面上下文、安全策略和浏览器执行结果确认。"
             ),
             remediation=(
                 "按输出上下文做编码（HTML 用 HTML 实体、属性用引号+实体、JS 用 JSON 转义）；"
                 "启用严格 CSP 作为纵深防御。"
             ),
-            confidence=0.95,
-            verified=True,
+            confidence=0.65,
+            verified=False,
             evidence=f"payload: {payload}\n响应位置: {idx}",
             request_snippet=f"GET {url}",
             response_snippet=_snippet(page.body, idx, idx + len(payload)),
@@ -147,40 +155,36 @@ async def _xss(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
 
 
 async def _sqli(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
-    sig_re = re.compile("|".join(config.SQLI_ERROR_SIGNATURES), re.I)
-    hit_payload = None
-    hit_page = None
-    for payload in config.SQLI_ERROR_PAYLOADS:
-        probe = f"{t['value']}{payload}" if t["value"] else payload
-        url = _with_param(t["url"], t["param"], probe)
+    signatures = [re.compile(pattern, re.I) for pattern in config.SQLI_ERROR_SIGNATURES]
+    signatures = [sig for sig in signatures if not sig.search(base_body)]
+    hits = {}
+    for payload in dict.fromkeys(config.SQLI_ERROR_PAYLOADS):
+        url = _with_param(t["url"], t["param"], t["value"] + payload)
         page = await fetcher.fetch(url, follow=False)
-        if page.error or 300 <= page.status < 400:
+        if not page.ok or 300 <= page.status < 400:
             continue
-        m = sig_re.search(page.body)
-        if m and not sig_re.search(base_body):
-            hit_payload, hit_page = payload, page
-            break
-    if not hit_payload or not hit_page:
-        return []
+        for sig in signatures:
+            match = sig.search(page.body)
+            if match is None:
+                continue
+            if sig in hits:
+                return _sqli_finding(t, hits[sig], payload, page, match)
+            hits[sig] = payload
+    return []
 
-    # 二次验证：换一个 payload，能再次触发同类报错才算真
-    second = config.SQLI_ERROR_PAYLOADS[1]
-    url2 = _with_param(t["url"], t["param"], f"{t['value']}{second}")
-    page2 = await fetcher.fetch(url2, follow=False)
-    if page2.error or 300 <= page2.status < 400 or not sig_re.search(page2.body):
-        return []
 
-    m = sig_re.search(hit_page.body)
+def _sqli_finding(t: dict, first: str, second: str, page: Page, match: re.Match) -> list[Finding]:
+    url = _with_param(t["url"], t["param"], t["value"] + second)
     return [
         Finding(
             rule_id="SQLI-ERROR",
             title="SQL 注入（错误回显型）",
             severity="critical",
             category="注入漏洞",
-            url=_with_param(t["url"], t["param"], f"{t['value']}{hit_payload}"),
+            url=url,
             param=t["param"],
             detail=(
-                f"参数 {t['param']} 拼接单引号后触发数据库报错，且基线响应无该报错；"
+                f"参数 {t['param']} 使用 {first!r} 后触发数据库报错，且基线响应无该报错；"
                 f"换用 {second!r} 可复现，判定为注入点。"
             ),
             remediation=(
@@ -189,9 +193,9 @@ async def _sqli(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
             ),
             confidence=0.9,
             verified=True,
-            evidence=f"payload: {hit_payload} / 复现: {second}",
-            request_snippet=f"GET {url2}",
-            response_snippet=_snippet(hit_page.body, m.start(), m.end()),
+            evidence=f"payload: {first} / 复现: {second}",
+            request_snippet=f"GET {url}",
+            response_snippet=_snippet(page.body, match.start(), match.end()),
             dedupe_key=f"SQLI-ERROR|{_with_param(t['url'], t['param'], '')}|{t['param']}",
         )
     ]
@@ -199,13 +203,17 @@ async def _sqli(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
 
 async def _lfi(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
     sig_re = re.compile("|".join(config.LFI_SIGNATURES), re.I)
-    for payload in config.LFI_PAYLOADS:
+    first = None
+    for payload in dict.fromkeys(config.LFI_PAYLOADS):
         url = _with_param(t["url"], t["param"], payload)
         page = await fetcher.fetch(url, follow=False)
         if page.error or 300 <= page.status < 400:
             continue
         m = sig_re.search(page.body)
         if m and not sig_re.search(base_body):
+            if first is None:
+                first = payload
+                continue
             return [
                 Finding(
                     rule_id="LFI",
@@ -223,7 +231,7 @@ async def _lfi(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
                     ),
                     confidence=0.95,
                     verified=True,
-                    evidence=f"payload: {payload}",
+                    evidence=f"payload: {first} / 复现: {payload}",
                     request_snippet=f"GET {url}",
                     response_snippet=_snippet(page.body, m.start(), m.end()),
                     dedupe_key=f"LFI|{_with_param(t['url'], t['param'], '')}|{t['param']}",
@@ -233,14 +241,19 @@ async def _lfi(t: dict, fetcher: Fetcher, base_body: str) -> list[Finding]:
 
 
 async def _redirect(t: dict, fetcher: Fetcher) -> list[Finding]:
-    evil = "//ws-evil.example/landing"
-    url = _with_param(t["url"], t["param"], evil)
-    page = await fetcher.fetch(url, follow=False)
-    if page.error or page.status not in (301, 302, 303, 307, 308):
-        return []
-    loc = page.header("location")
-    if "ws-evil.example" not in loc:
-        return []
+    for host in ("ws-evil.example", "ws-confirm.example"):
+        evil = f"//{host}/landing"
+        url = _with_param(t["url"], t["param"], evil)
+        page = await fetcher.fetch(url, follow=False)
+        if not page.ok or page.status not in (301, 302, 303, 307, 308):
+            return []
+        loc = page.header("location")
+        try:
+            destination = urlsplit(urljoin(url, loc))
+        except ValueError:
+            return []
+        if destination.scheme not in ("http", "https") or destination.hostname != host:
+            return []
     return [
         Finding(
             rule_id="OPEN-REDIRECT",
